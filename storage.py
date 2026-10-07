@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from blockchain import Block, create_genesis_block
@@ -95,6 +97,24 @@ def init_db() -> bool:
                 FOREIGN KEY(block_index) REFERENCES blocks("index")
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS money_notifications (
+                block_index INTEGER PRIMARY KEY REFERENCES blocks("index"),
+                recipient_id INTEGER NOT NULL,
+                sender_label TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'processing', 'sent', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS money_notifications_due "
+            "ON money_notifications(status, next_attempt_at)"
         )
         count = conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
         if count == 0:
@@ -268,3 +288,83 @@ def _list_players(conn: sqlite3.Connection, limit: int, offset: int) -> list[tup
 
 def _count_players(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+
+
+def _insert_money_notification(
+    conn: sqlite3.Connection, block_index: int, recipient_id: int,
+    sender_label: str, message: str = "",
+) -> None:
+    conn.execute(
+        "INSERT INTO money_notifications (block_index, recipient_id, sender_label, message) "
+        "VALUES (?, ?, ?, ?)",
+        (block_index, recipient_id, sender_label, message),
+    )
+
+
+@dataclass(frozen=True)
+class MoneyNotification:
+    block_index: int
+    recipient_id: int
+    sender_label: str
+    message: str
+    amount: float
+    attempts: int
+
+
+def claim_money_notification(now: float | None = None) -> MoneyNotification | None:
+    """Берёт одну запись; незавершённая отправка доступна снова через 5 минут."""
+    current_time = time.time() if now is None else now
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            'SELECT n.block_index, n.recipient_id, n.sender_label, n.message, b.amount, n.attempts '
+            'FROM money_notifications n JOIN blocks b ON b."index" = n.block_index '
+            "WHERE n.status IN ('pending', 'processing') AND n.next_attempt_at <= ? "
+            "ORDER BY n.block_index LIMIT 1",
+            (current_time,),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        attempt = row[5] + 1
+        conn.execute(
+            "UPDATE money_notifications SET status = 'processing', attempts = ?, "
+            "next_attempt_at = ? WHERE block_index = ?",
+            (attempt, current_time + 300, row[0]),
+        )
+        conn.commit()
+        return MoneyNotification(*row[:5], attempt)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finish_money_notification(
+    notification: MoneyNotification, status: str, retry_after: float = 0,
+) -> None:
+    if status not in ("pending", "sent", "failed"):
+        raise ValueError("Invalid notification status")
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE money_notifications SET status = ?, next_attempt_at = ? "
+            "WHERE block_index = ? AND status = 'processing' AND attempts = ?",
+            (status, time.time() + max(0, retry_after), notification.block_index, notification.attempts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_transaction_message(block_index: int) -> str:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT message FROM money_notifications WHERE block_index = ?", (block_index,)
+        ).fetchone()
+        return "" if row is None else row[0]
+    finally:
+        conn.close()

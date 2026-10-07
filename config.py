@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from dotenv import dotenv_values
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_DIR / "chain.db"
@@ -51,7 +53,17 @@ class BotConfig:
 
 
 def load_bot_config(environ: Mapping[str, str] | None = None) -> BotConfig:
-    env = os.environ if environ is None else environ
+    if environ is None:
+        # Читаем .env рядом с кодом, независимо от каталога запуска.
+        # Переменные окружения имеют приоритет над настройками файла.
+        env = {
+            key: value
+            for key, value in dotenv_values(PROJECT_DIR / ".env", encoding="utf-8-sig").items()
+            if value is not None
+        }
+        env.update(os.environ)
+    else:
+        env = environ
     token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise ConfigurationError("Не задан TELEGRAM_BOT_TOKEN.")
@@ -65,4 +77,3 @@ def load_bot_config(environ: Mapping[str, str] | None = None) -> BotConfig:
         raise ConfigurationError("TELEGRAM_ADMIN_ID должен быть положительным числом.")
 
     return BotConfig(token=token, admin_id=admin_id, db_path=resolve_db_path(env))
-

@@ -15,6 +15,7 @@ from blockchain import Block, calculate_balance, create_new_block, validate_chai
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$", re.ASCII)
 STARTING_BALANCE = 100.0
+MAX_TRANSFER_MESSAGE_LENGTH = 1000
 
 
 class ServiceError(Exception):
@@ -155,9 +156,27 @@ def _valid_chain(conn) -> list[Block]:
     return blocks
 
 
-def _fingerprint(action_type: str, actor_id: int, sender: str, recipient: str, amount: float) -> str:
+def normalize_transfer_message(message: str | None) -> str:
+    if message is None:
+        return ""
+    if not isinstance(message, str):
+        raise ValidationError("Сообщение должно быть текстом.")
+    value = message.strip()
+    if len(value) > MAX_TRANSFER_MESSAGE_LENGTH:
+        raise ValidationError(f"Сообщение должно содержать не больше {MAX_TRANSFER_MESSAGE_LENGTH} символов.")
+    return value
+
+
+def _fingerprint(
+    action_type: str, actor_id: int, sender: str, recipient: str, amount: float,
+    message: str = "",
+) -> str:
+    fields = [action_type, actor_id, sender, recipient, amount.hex()]
+    # Пустое сообщение сохраняет формат прежних ключей идемпотентности.
+    if message:
+        fields.append(message)
     payload = json.dumps(
-        [action_type, actor_id, sender, recipient, amount.hex()],
+        fields,
         ensure_ascii=True,
         separators=(",", ":"),
     )
@@ -239,9 +258,11 @@ def create_player_transaction(
     recipient_username: str,
     amount: float | str,
     action_key: str,
+    message: str | None = None,
 ) -> Block:
     recipient_name = normalize_username(recipient_username)
     value = _amount(amount)
+    note = normalize_transfer_message(message)
     if not action_key or len(action_key) > 128:
         raise ValidationError("Некорректный ключ подтверждения.")
     conn = storage.get_connection()
@@ -253,7 +274,7 @@ def create_player_transaction(
         sender = _player(sender_row)
         recipient_account = f"@{recipient_name}"
         fingerprint = _fingerprint(
-            "player_transfer", telegram_id, sender.account_name, recipient_account, value
+            "player_transfer", telegram_id, sender.account_name, recipient_account, value, note
         )
         existing = _existing_action(
             conn, action_key, telegram_id, "player_transfer", fingerprint
@@ -275,6 +296,9 @@ def create_player_transaction(
         storage._insert_block(conn, block)
         storage._insert_action(
             conn, action_key, telegram_id, "player_transfer", fingerprint, block.index, _now()
+        )
+        storage._insert_money_notification(
+            conn, block.index, recipient.telegram_id, sender.account_name, note
         )
         conn.commit()
         return block
@@ -324,6 +348,9 @@ def create_admin_grant(
         storage._insert_action(
             conn, action_key, admin_telegram_id, "admin_grant", fingerprint, block.index, _now()
         )
+        admin_row = storage._get_player_by_id(conn, admin_telegram_id)
+        sender_label = "Администратор" if admin_row is None else f"Администратор @{admin_row[1]}"
+        storage._insert_money_notification(conn, block.index, recipient.telegram_id, sender_label)
         conn.commit()
         return block
     except Exception:
@@ -349,6 +376,14 @@ def create_trusted_transaction(sender: str, recipient: str, amount: float | str)
                 raise InsufficientFundsError(balance, value)
         block = create_new_block(blocks[-1], sender_name, recipient_name, value)
         storage._insert_block(conn, block)
+        # CLI по-прежнему работает с базами старого формата до запуска бота/init.
+        has_notifications = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'money_notifications'"
+        ).fetchone()
+        if has_notifications and recipient_name.startswith("@"):
+            recipient_row = storage._get_player_by_username(conn, recipient_name[1:])
+            if recipient_row is not None and recipient_name == f"@{recipient_row[1]}":
+                storage._insert_money_notification(conn, block.index, recipient_row[0], sender_name)
         conn.commit()
         return block
     except Exception:

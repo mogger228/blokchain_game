@@ -12,3 +12,4 @@ test-*.db
 *.db-wal
 *.db-shm
 desktop.ini
+logs/

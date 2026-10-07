@@ -3,9 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from telegram.ext import ConversationHandler
+from telegram.error import TimedOut
 
 import bot_handlers as handlers
 import service
@@ -57,6 +58,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await handlers.begin_transfer(self.update(callback="menu:transfer"), self.context)
         await handlers.receive_transfer_recipient(self.update(text="Bob__22"), self.context)
         await handlers.receive_transfer_amount(self.update(text="25"), self.context)
+        await handlers.skip_transfer_message(self.update(callback="tx:skip_message"), self.context)
         key = self.context.user_data["active_intent"]["key"]
         confirmed = self.update(callback=f"tx:confirm:{key}")
         await handlers.confirm_transfer(confirmed, self.context)
@@ -64,6 +66,77 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Hash:", confirmed.callback_query.edit_message_text.call_args.args[0])
         await handlers.confirm_transfer(confirmed, self.context)
         self.assertEqual(service.get_player_balance(1).balance, 75)
+
+    async def test_transfer_message_confirmation_and_search(self):
+        service.register_player(1, "Alice_1")
+        service.register_player(2, "Bob__22")
+        await handlers.receive_transfer_recipient(self.update(text="Bob__22"), self.context)
+        self.assertEqual(
+            await handlers.receive_transfer_amount(self.update(text="25"), self.context),
+            handlers.TRANSFER_MESSAGE,
+        )
+        for text in ("   ", "x" * 1001):
+            self.assertEqual(
+                await handlers.receive_transfer_message(self.update(text=text), self.context),
+                handlers.TRANSFER_MESSAGE,
+            )
+        message_update = self.update(text="  Спасибо! 💛\nЗа помощь  ")
+        self.assertEqual(
+            await handlers.receive_transfer_message(message_update, self.context),
+            handlers.TRANSFER_CONFIRM,
+        )
+        self.assertIn("Спасибо! 💛\nЗа помощь", message_update.effective_message.reply_text.call_args.args[0])
+        key = self.context.user_data["active_intent"]["key"]
+        await handlers.confirm_transfer(self.update(callback=f"tx:confirm:{key}"), self.context)
+        block = storage.get_last_block()
+        searched = self.update(user_id=9, text=str(block.index))
+        await handlers.receive_search_id(searched, self.context)
+        self.assertIn("Спасибо! 💛\nЗа помощь", searched.effective_message.reply_text.call_args.args[0])
+        self.assertEqual(service.get_player_balance(2).balance, 125)
+
+    async def test_search_hides_message_from_non_admin_users(self):
+        service.register_player(1, "Alice_1")
+        service.register_player(2, "Bob__22")
+        block = service.create_player_transaction(1, "Bob__22", 25, "private-note", "Личный текст 💛")
+        for user_id in (1, 2, 3):
+            with self.subTest(user_id=user_id):
+                searched = self.update(user_id=user_id, username="Admin_9", text=str(block.index))
+                with patch("storage.get_transaction_message") as read_message:
+                    result = await handlers.receive_search_id(searched, self.context)
+                read_message.assert_not_called()
+                self.assertEqual(result, ConversationHandler.END)
+                text = searched.effective_message.reply_text.call_args.args[0]
+                self.assertIn(f"Блок #{block.index}", text)
+                self.assertIn("$25", text)
+                self.assertNotIn("Личный текст", text)
+                self.assertNotIn("Сообщение отправителя", text)
+
+    async def test_search_does_not_expose_admin_message_in_group(self):
+        service.register_player(1, "Alice_1")
+        service.register_player(2, "Bob__22")
+        block = service.create_player_transaction(1, "Bob__22", 25, "group-note", "Личный текст")
+        searched = self.update(user_id=9, text=str(block.index), chat_type="group")
+        with patch("storage.get_transaction_message") as read_message:
+            await handlers.receive_search_id(searched, self.context)
+        read_message.assert_not_called()
+        self.assertNotIn("Личный текст", searched.effective_message.reply_text.call_args.args[0])
+
+    async def test_sender_reply_failure_keeps_credit_and_notification(self):
+        service.register_player(1, "Alice_1")
+        service.register_player(2, "Bob__22")
+        await handlers.receive_transfer_recipient(self.update(text="Bob__22"), self.context)
+        await handlers.receive_transfer_amount(self.update(text="25"), self.context)
+        await handlers.skip_transfer_message(self.update(callback="tx:skip_message"), self.context)
+        key = self.context.user_data["active_intent"]["key"]
+        confirmation = self.update(callback=f"tx:confirm:{key}")
+        confirmation.callback_query.edit_message_text.side_effect = TimedOut()
+        with self.assertRaises(TimedOut):
+            await handlers.confirm_transfer(confirmation, self.context)
+        self.assertEqual(service.get_player_balance(2).balance, 125)
+        notice = storage.claim_money_notification()
+        self.assertEqual(notice.amount, 25)
+        self.assertEqual(notice.recipient_id, 2)
+        self.assertNotIn("active_intent", self.context.user_data)
 
     async def test_cancel_and_new_flow_invalidate_intent(self):
         service.register_player(1, "Alice_1")
@@ -112,4 +185,3 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             update = self.update(callback=callback)
             await handler(update, self.context)
             self.assertIn("прав", update.callback_query.edit_message_text.call_args.args[0])
-

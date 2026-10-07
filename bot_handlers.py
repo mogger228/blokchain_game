@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 
 import service
+import storage
 from formatters import format_amount, format_block, split_chain
 
 
@@ -29,6 +30,7 @@ from formatters import format_amount, format_block, split_chain
     ADMIN_CUSTOM_AMOUNT,
     ADMIN_CONFIRM,
 ) = range(8)
+TRANSFER_MESSAGE = 8
 
 CANCEL = "flow:cancel"
 
@@ -79,6 +81,7 @@ async def _edit_or_reply(update: Update, text: str, markup=None) -> None:
 def _clear_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
     for key in (
         "transfer_recipient",
+        "transfer_amount",
         "active_intent",
         "admin_recipient",
     ):
@@ -183,7 +186,16 @@ async def receive_search_id(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"Транзакция #{block_id} не найдена.", reply_markup=_home_button()
         )
     else:
-        await update.effective_message.reply_text(format_block(block), reply_markup=_home_button())
+        text = format_block(block)
+        if (
+            _is_admin(update, context)
+            and update.effective_chat is not None
+            and update.effective_chat.type == Chat.PRIVATE
+        ):
+            message = storage.get_transaction_message(block.index)
+            if message:
+                text += f"\n\nСообщение отправителя:\n{message}"
+        await update.effective_message.reply_text(text, reply_markup=_home_button())
     return ConversationHandler.END
 
 
@@ -226,12 +238,44 @@ async def receive_transfer_amount(update: Update, context: ContextTypes.DEFAULT_
     except service.ValidationError as exc:
         await update.effective_message.reply_text(str(exc))
         return TRANSFER_AMOUNT
+    context.user_data["transfer_amount"] = amount
+    await update.effective_message.reply_text(
+        f"Добавьте сообщение получателю (до {service.MAX_TRANSFER_MESSAGE_LENGTH} символов) "
+        "или нажмите «Без сообщения».",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Без сообщения", callback_data="tx:skip_message")],
+            [InlineKeyboardButton("Отмена", callback_data=CANCEL)],
+        ]),
+    )
+    return TRANSFER_MESSAGE
+
+
+async def receive_transfer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        message = service.normalize_transfer_message(update.effective_message.text)
+        if not message:
+            raise service.ValidationError("Введите сообщение или нажмите «Без сообщения».")
+    except service.ValidationError as exc:
+        await update.effective_message.reply_text(str(exc))
+        return TRANSFER_MESSAGE
+    return await _prepare_transfer_confirmation(update, context, message)
+
+
+async def skip_transfer_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _prepare_transfer_confirmation(update, context, "")
+
+
+async def _prepare_transfer_confirmation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, message: str,
+) -> int:
+    amount = context.user_data["transfer_amount"]
     key = uuid.uuid4().hex
     intent = {
         "kind": "transfer",
         "key": key,
         "recipient": context.user_data["transfer_recipient"],
         "amount": amount,
+        "message": message,
     }
     context.user_data["active_intent"] = intent
     markup = InlineKeyboardMarkup(
@@ -240,10 +284,9 @@ async def receive_transfer_amount(update: Update, context: ContextTypes.DEFAULT_
             InlineKeyboardButton("Отмена", callback_data=CANCEL),
         ]]
     )
-    await update.effective_message.reply_text(
-        f"Перевести ${format_amount(amount)} пользователю @{intent['recipient']}?",
-        reply_markup=markup,
-    )
+    text = f"Перевести ${format_amount(amount)} пользователю @{intent['recipient']}?"
+    text += f"\n\nСообщение:\n{message}" if message else "\nБез сообщения."
+    await _edit_or_reply(update, text, markup)
     return TRANSFER_CONFIRM
 
 
@@ -257,7 +300,8 @@ async def confirm_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ConversationHandler.END
     try:
         block = service.create_player_transaction(
-            update.effective_user.id, intent["recipient"], intent["amount"], key
+            update.effective_user.id, intent["recipient"], intent["amount"], key,
+            message=intent.get("message", ""),
         )
     except service.ServiceError as exc:
         _clear_flow(context)
@@ -532,6 +576,10 @@ def register_handlers(application) -> None:
         states={
             TRANSFER_RECIPIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transfer_recipient)],
             TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transfer_amount)],
+            TRANSFER_MESSAGE: [
+                CallbackQueryHandler(skip_transfer_message, pattern=r"^tx:skip_message$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transfer_message),
+            ],
             TRANSFER_CONFIRM: [CallbackQueryHandler(confirm_transfer, pattern=r"^tx:confirm:[0-9a-f]{32}$")],
             SEARCH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_search_id)],
             ADMIN_RECIPIENT: [
